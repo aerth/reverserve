@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -26,24 +27,14 @@ import (
 	"time"
 )
 
-// CLI flags
-var (
-	listen  = flag.String("http", ":80", "Interface and port to listen on, Example: -http=127.0.0.1:80 ")
-	slisten = flag.String("https", ":443", "Interface and port to listen on, Example: -http=:443\n\tNote: When using TLS, all the targets will be served with the same CERTIFICATE. This will be fixed some time.")
-	key     = flag.String("key", "", "https/SSL/TLS key.pem")
-	cert    = flag.String("cert", "", "https/SSL/TLS cert.pem")
-	config  = flag.String("config", "config.ini", "location of config file")
-	debug   = flag.Bool("v", false, "Enable logs")
-)
-
 // Server listens on 80 and 443, acting as a router to the target[map]
 type Server struct {
 	Name    string
 	proxy   *httputil.ReverseProxy      // default proxy , can be nil. Will show 503 error in that case.
-	mutex   sync.Mutex                  // This mutex guards writing/reading the map.
 	targets map[string]*Proxy           // target proxies, map[url]proxy
 	config  map[string]*url.URL         // config
 	sconfig map[string]*tls.Certificate // sconfig is https
+	debug   bool
 }
 
 // Proxy is a reverse proxy
@@ -55,34 +46,30 @@ type Proxy struct {
 	isProxy bool
 	errors  *bytes.Buffer
 	log     *log.Logger
+	debug   bool
 }
 
-/*
-Load the config.ini into memory
-
-The file should look something like this:
-host1.com http://realhost:8080
-host3.com http://realhost:8081
-host4.com http://127.0.0.1:8082
-_ index.html
-
-This example config listens for requests on host1,host2,host4,
-and serves the content from port 8080, 8081, 8082
-_ means "serve ./index.html for everything", otherwise we give a 503 error.
-
-*/
-func (s *Server) configger() {
-
-	log.Println("Initializing config:", *config)
+// load the config.ini into memory
+//
+// the file should look something like this:
+// host1.com http://realhost:8080
+// host3.com http://realhost:8081
+// host4.com http://127.0.0.1:8082
+// _ index.html
+//
+// this example config listens for requests on host1,host2,host4,
+// and serves the content from port 8080, 8081, 8082
+// _ means "serve ./index.html for everything", otherwise we give a 503 error.
+func NewWithConfig(config string) *Server {
+	s := New()
+	log.Println("Initializing config:", config)
 	m := map[string]*url.URL{}
-	b, e := ioutil.ReadFile(*config)
+	b, e := ioutil.ReadFile(config)
 	if e != nil {
-		log.Fatalln(e)
-		log.Fatalln("Please make " + *config + " -- here is an example:\n\n" +
+		log.Println(e)
+		log.Fatalln("Please make " + config + " -- here is an example:\n\n" +
 			"example.com http://127.0.0.1:8080\nexample2.com http://127.0.0.1:8081\n")
-
 	}
-
 	lines := strings.Split(string(b), "\n") // split lines
 	for _, line := range lines {
 		parts := strings.Split(line, " ") // check spaces
@@ -97,21 +84,19 @@ func (s *Server) configger() {
 			log.Println(e)
 			continue
 		}
-		s.mutex.Lock()
 		log.Println("Adding: ", parts[0], u)
-
 		m[parts[0]] = u
-		s.mutex.Unlock()
 	}
 	s.config = m
 	for i, v := range s.config {
 		log.Println("Serving:", i, v)
 	}
+	return s
 
 }
-func sconfigger() map[string][]string {
+func file2map(config string) map[string][]string {
 	m := map[string][]string{}
-	b, _ := ioutil.ReadFile(*config)
+	b, _ := ioutil.ReadFile(config)
 	lines := strings.Split(string(b), "\n")
 	for _, line := range lines {
 		words := strings.Split(line, " ")
@@ -124,14 +109,21 @@ func sconfigger() map[string][]string {
 
 // Reverserve
 func main() {
+	// CLI flags
+	var (
+		listen  = flag.String("http", ":8080", "Interface and port to listen on, Example: -http=127.0.0.1:80 ")
+		slisten = flag.String("https", ":443", "Interface and port to listen on, Example: -http=:443\n\tNote: When using TLS, all the targets will be served with the same CERTIFICATE. This will be fixed some time.")
+		key     = flag.String("key", "", "https/SSL/TLS key.pem")
+		cert    = flag.String("cert", "", "https/SSL/TLS cert.pem")
+		config  = flag.String("config", "config.ini", "location of config file")
+		debug   = flag.Bool("v", false, "Enable logs")
+	)
 	flag.Parse()
 	if *debug {
 		log.SetFlags(log.Llongfile)
 		ToDo()
 	}
-	s := New()
-	s.configger()
-
+	s := NewWithConfig(*config)
 	if len(s.config) < 1 {
 		log.Fatalln("Please make config.ini -- here is an example:\n\n" +
 			"example.com http://127.0.0.1:8080\nexample2.com http://127.0.0.1:8081\n")
@@ -139,18 +131,22 @@ func main() {
 	if *key != "" && len(s.config) < 1 {
 		log.Println("Not fatal: config has no https hosts")
 	}
-	go s.fresh()
-	s.serve()
+	s.fresh()
+	if *key != "" {
+		go s.servetls(*slisten, *cert, *key)
+	}
+	s.serve(*listen)
+
 }
 
 // Main serve loop
-func (s *Server) serve() {
+func (s *Server) serve(addr string) {
 	http.Handle("/", s)
 	// Message listen success
 	go func() {
 		select {
 		case <-time.After(200 * time.Millisecond):
-			log.Println("Reverserve: Serving HTTP on:", *listen)
+			log.Println("Reverserve: Serving HTTP on:", addr)
 			log.Println("Host table:")
 			for i, v := range s.config {
 				log.Println(i, v)
@@ -158,7 +154,7 @@ func (s *Server) serve() {
 
 		}
 	}()
-	log.Fatal(http.ListenAndServe(*listen, nil))
+	log.Fatal(http.ListenAndServe(addr, nil))
 
 }
 
@@ -166,13 +162,12 @@ func (s *Server) serve() {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Hijack proxy log
-	p.mutex.Lock()
 	erbuf := new(bytes.Buffer)
 	tmplog := log.New(erbuf, "", log.Ltime)
 	p.proxy.ErrorLog = tmplog
 
 	// Reverse proxy
-	if *debug {
+	if p.debug {
 		log.Println(r.Host, r.RequestURI)
 	}
 
@@ -181,28 +176,32 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Proxy log gave us an error. Error is only non-nil if no body was written.
 	if erbuf.Len() != 0 {
 		er := erbuf.String()
-		log.Println(er)   // log real error, user gets 502 bad gateway
-		erbuf.Truncate(0) // Clear p.errors buffer
-		w.Write([]byte("503 Service Unavailable\n"))
+		log.Println("proxy error:", er) // log real error, user gets 503 bad gateway
+		erbuf.Truncate(0)               // Clear p.errors buffer
+		http.Error(w, "503 Service Unavailable\n", 503)
+		return
 	}
-
-	p.mutex.Unlock()
-
 	return
 }
 
 // ServeHTTP server
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// unique-enough id
+	ueid := fmt.Sprintf("%6d", rand.Intn(999999))
+	log.Println(ueid, r.Method, r.Host, r.URL.Path, r.RemoteAddr, r.UserAgent(), r.ContentLength)
+	t1 := time.Now()
+	defer func() {
+		log.Printf("%s finished after %s ms", ueid, time.Since(t1))
+	}()
 
 	// If there is no proxy by that name, give a 503 status.
 	if s.targets[r.Host] == nil {
-		fmt.Printf("%q %s\n", r.Host, "Host is not in map")
-		log.Println("here is the entire map:", s.targets)
+		log.Println("Denied:", r.Host)
+		//fmt.Printf("%q %s\n", r.Host, "Host is not in map")
+		//log.Println("here is the entire map:", s.targets)
 		errar(w, r)
 		return
 	}
-
-	log.Println(r.Host, "matches", s.targets[r.Host].Name)
 
 	// Send to real proxy handler
 	s.targets[r.Host].ServeHTTP(w, r)
@@ -217,7 +216,7 @@ func New() *Server {
 	return s
 }
 
-// NewProxyTarget creates new proxy
+// NewProxyTarget creates new proxy ( no loggers )
 func NewProxyTarget(target string) (*Server, error) {
 	u, e := url.Parse(target)
 	if e != nil {
@@ -234,7 +233,7 @@ func (s *Server) newProxy(target *url.URL) *Proxy {
 	p.parent = s
 	var buf = new(bytes.Buffer)
 	p.errors = buf
-	logger2 := log.New(p.errors, "", log.Ltime)
+	logger2 := log.New(p.errors, "]", log.Ltime)
 	p.proxy = httputil.NewSingleHostReverseProxy(target)
 	p.proxy.ErrorLog = logger2
 	return p
@@ -242,34 +241,21 @@ func (s *Server) newProxy(target *url.URL) *Proxy {
 
 // Bind creates a new server, places it inside s.targets map
 func (s *Server) Bind(host string, target *url.URL) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	p := s.newProxy(target)
 	s.targets[host] = p
 	return nil
 }
 func errar(w http.ResponseWriter, r *http.Request) {
-	if *debug {
-		log.Println("Bad:", r.Host, r.RequestURI)
-	}
 	w.WriteHeader(http.StatusServiceUnavailable)
-	//w.Write(errorBytes)
 	w.Write([]byte(http.StatusText(http.StatusServiceUnavailable)))
 }
+
 func (s *Server) fresh() {
-
-	for {
-		// Add each config host to the map
-		for i, v := range s.config {
-			err := s.Bind(i, v)
-			if err != nil {
-				panic(err)
-			}
+	for i, v := range s.config {
+		err := s.Bind(i, v)
+		if err != nil {
+			log.Fatal(err)
 		}
-
-		// Load every minute
-		s.configger()
-		time.Sleep(1 * time.Minute)
 	}
 }
 

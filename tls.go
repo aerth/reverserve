@@ -9,40 +9,42 @@ import (
 	"time"
 )
 
-func (s *Server) tlsServe() {
+func (s *Server) servetls(slisten string, cert, key string) {
 
-	fmt.Println("Reverserve: Serving TLS on:", *slisten)
+	fmt.Println("Reverserve: Serving TLS on:", slisten)
+	var handle http.HandlerFunc
+	if len(s.targets) == 0 {
+		handle = http.NotFound
+	} else {
+		handle = func(w http.ResponseWriter, r *http.Request) {
+			log.Println(r.Method, r.Host, r.URL.Path, r.RemoteAddr, r.UserAgent(), r.ContentLength)
+			if s.targets[r.Host] == nil {
+				log.Println(r.Host, "not in config, denying")
+				errar(w, r)
+				return
+			}
+			if r.TLS.HandshakeComplete {
+				r.URL.Scheme = "https"
+			}
 
-	handle := func(w http.ResponseWriter, r *http.Request) {
+			// // Send to real proxy handler
+			s.targets[r.Host].ServeHTTP(w, r)
 
-		if s.targets[r.Host] == nil {
-			log.Println(r.Host, "not in config")
-			errar(w, r)
 			return
 		}
-		log.Println(r.Host, "found")
-		log.Println(r.URL.Scheme)
-		// // Send to real proxy handler
-		if r.TLS.HandshakeComplete {
-			r.URL.Scheme = "https"
-		}
-
-		s.targets[r.Host].ServeHTTP(w, r)
-
-		return
 	}
 	srv := &http.Server{
-		Addr:           *slisten,
+		Addr:           slisten,
 		Handler:        http.HandlerFunc(handle),
 		ReadTimeout:    20 * time.Second,
 		WriteTimeout:   20 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
-	z, e := tls.LoadX509KeyPair(*cert, *key)
+	z, e := tls.LoadX509KeyPair(cert, key)
 	if e != nil {
 		log.Fatalln("TLS Certificate:", e)
 	} else {
-		log.Println("Loaded:", *cert)
+		log.Println("Loaded:", cert)
 	}
 
 	tlsListener, e := tls.Listen("tcp", srv.Addr, &tls.Config{Certificates: []tls.Certificate{z}})
@@ -53,7 +55,7 @@ func (s *Server) tlsServe() {
 	fmt.Println("Trying:")
 
 	tlsconf := new(tls.Config)
-	for _, m := range sconfigger() {
+	for _, m := range file2map("config.ini") {
 		fmt.Println("Trying:", m[2], m[3])
 		c, e := tls.LoadX509KeyPair(m[2], m[3])
 		if e != nil {
